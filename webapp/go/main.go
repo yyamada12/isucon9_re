@@ -147,6 +147,13 @@ type TransactionEvidence struct {
 	UpdatedAt          time.Time `json:"-" db:"updated_at"`
 }
 
+type TransactionEvidenceWithReserveId struct {
+	ID        int64  `json:"id" db:"id"`
+	Status    string `json:"status" db:"status"`
+	ItemID    int64  `json:"item_id" db:"item_id"`
+	ReserveID string `json:"reserve_id" db:"reserve_id"`
+}
+
 type Shipping struct {
 	TransactionEvidenceID int64     `json:"transaction_evidence_id" db:"transaction_evidence_id"`
 	Status                string    `json:"status" db:"status"`
@@ -426,6 +433,27 @@ func getUserSimpleMapByIDs(q sqlx.Queryer, userIDs []int64) (userSimpleMap map[i
 		userSimple.AccountName = user.AccountName
 		userSimple.NumSellItems = user.NumSellItems
 		userSimpleMap[user.ID] = userSimple
+	}
+
+	return
+}
+
+func getTransactionEvidenceMapByItemIDs(q sqlx.Queryer, itemIDs []int64) (resMap map[int64]TransactionEvidenceWithReserveId, err error) {
+	res := []TransactionEvidenceWithReserveId{}
+	qs, args, err := sqlx.In("SELECT te.id as id, te.status as status, te.item_id as item_id, s.reserve_id as reserve_id FROM `transaction_evidences` AS te JOIN `shippings` AS s ON te.ID = s.transaction_evidence_id WHERE te.`item_id` IN (?)", itemIDs)
+
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	err = sqlx.Select(q, &res, qs, args...)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	resMap = make(map[int64]TransactionEvidenceWithReserveId)
+	for _, v := range res {
+		resMap[v.ItemID] = v
 	}
 
 	return
@@ -929,12 +957,19 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	itemDetails := []ItemDetail{}
 
 	var userIds []int64
+	var itemIds []int64
 	for _, item := range items {
 		userIds = append(userIds, item.SellerID)
 		userIds = append(userIds, item.BuyerID)
+		itemIds = append(itemIds, item.ID)
 	}
 
 	userSimpleMap, err := getUserSimpleMapByIDs(tx, userIds)
+	if err != nil {
+		log.Print(err)
+	}
+
+	evidenceMap, err := getTransactionEvidenceMapByItemIDs(tx, itemIds)
 	if err != nil {
 		log.Print(err)
 	}
@@ -983,32 +1018,11 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			itemDetail.Buyer = &buyer
 		}
 
-		transactionEvidence := TransactionEvidence{}
-		err = tx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
-		if err != nil && err != sql.ErrNoRows {
-			// It's able to ignore ErrNoRows
-			log.Print(err)
-			outputErrorMsg(w, http.StatusInternalServerError, "db error")
-			tx.Rollback()
-			return
-		}
+		evi, ok := evidenceMap[item.ID]
 
-		if transactionEvidence.ID > 0 {
-			shipping := Shipping{}
-			err = tx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
-			if err == sql.ErrNoRows {
-				outputErrorMsg(w, http.StatusNotFound, "shipping not found")
-				tx.Rollback()
-				return
-			}
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "db error")
-				tx.Rollback()
-				return
-			}
+		if ok && evi.ID > 0 {
 			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
-				ReserveID: shipping.ReserveID,
+				ReserveID: evi.ReserveID,
 			})
 			if err != nil {
 				log.Print(err)
@@ -1017,8 +1031,8 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			itemDetail.TransactionEvidenceID = transactionEvidence.ID
-			itemDetail.TransactionEvidenceStatus = transactionEvidence.Status
+			itemDetail.TransactionEvidenceID = evi.ID
+			itemDetail.TransactionEvidenceStatus = evi.Status
 			itemDetail.ShippingStatus = ssr.Status
 		}
 
